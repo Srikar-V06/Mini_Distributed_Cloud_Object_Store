@@ -1,0 +1,68 @@
+
+x-worker: &worker
+  build: ./worker
+  restart: unless-stopped
+  environment: &worker-env
+    CONTROLLER_URL: http://controller:8000
+    HEARTBEAT_INTERVAL: "3"
+
+services:
+
+  controller:
+    build: ./controller
+    container_name: controller
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - controller_meta:/meta
+    environment:
+      DEAD_AFTER: "10"
+      REPAIR_DELAY: "15"
+
+  worker1:
+    <<: *worker
+    container_name: worker1
+    volumes:
+      - worker1_data:/data
+    environment:
+      <<: *worker-env
+      WORKER_ID: worker1
+
+  worker2:
+    <<: *worker
+    container_name: worker2
+    volumes:
+      - worker2_data:/data
+    environment:
+      <<: *worker-env
+      WORKER_ID: worker2
+
+  worker3:
+    <<: *worker
+    container_name: worker3
+    volumes:
+      - worker3_data:/data
+    environment:
+      <<: *worker-env
+      WORKER_ID: worker3
+
+  worker4:
+    <<: *worker
+    container_name: worker4
+    volumes:
+      - worker4_data:/data
+    environment:
+      <<: *worker-env
+      WORKER_ID: worker4
+
+volumes:
+  controller_meta:
+  worker1_data:
+  worker2_data:
+  worker3_data:
+  worker4_data:
+
+networks:
+  default:
+    name: objectstore-net
