@@ -17,6 +17,7 @@ services:
     volumes:
       - controller_meta:/meta
     environment:
+      PYTHONUNBUFFERED: "1"
       DEAD_AFTER: "10"
       REPAIR_DELAY: "15"
 
