@@ -6,12 +6,18 @@ from fastapi import BackgroundTasks, FastAPI
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+from fastapi import Request
+from fastapi.responses import JSONResponse
+from errors import ApiError
+
 import reconcile
 import registry
+import upload
 from db import init_db
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("controller")
+
 
 
 @asynccontextmanager
@@ -66,3 +72,9 @@ def admin_workers():
     workers = registry.list_workers()
     return {"workers": workers,
             "alive_count": sum(1 for w in workers if w["status"] == "alive")}
+
+@app.exception_handler(ApiError) #temporary handler
+async def api_error_handler(request: Request, exc: ApiError):
+    return JSONResponse(status_code=exc.status,
+                        content={"error": exc.code, "message": exc.message})
+app.include_router(upload.router)
