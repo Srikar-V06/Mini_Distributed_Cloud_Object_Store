@@ -1,3 +1,7 @@
+import math
+import re
+from urllib.parse import quote
+
 import httpx
 from config import WORKER_CONNECT_TIMEOUT, WORKER_READ_TIMEOUT
 
@@ -38,4 +42,42 @@ def fetch_chunk(address: str, chunk_id: str):
     if r.status_code == 404:
         return "missing", None
     return "unreachable", None
+
+
+def list_worker_chunks(address: str, worker_id: str) -> dict[str, dict] | None:
+    """Return a complete inventory, or None if it could not be trusted."""
+    try:
+        response = httpx.get(f"{address}/internal/workers/{quote(worker_id, safe='')}/chunks",
+                             timeout=_timeout)
+        response.raise_for_status()
+        payload = response.json()
+    except (httpx.HTTPError, ValueError):
+        return None
+
+    if (not isinstance(payload, dict) or payload.get("worker_id") != worker_id
+            or not isinstance(payload.get("chunks"), list)):
+        return None
+
+    inventory = {}
+    for chunk in payload["chunks"]:
+        if not isinstance(chunk, dict):
+            return None
+        chunk_id = chunk.get("chunk_id")
+        if not isinstance(chunk_id, str):
+            return None
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,200}", chunk_id):
+            continue  # The worker API cannot operate on unrelated files in the chunk directory.
+        checksum = chunk.get("checksum")
+        size = chunk.get("size")
+        age = chunk.get("age_seconds")
+        try:
+            valid_age = type(age) in (int, float) and math.isfinite(age)
+        except OverflowError:
+            return None
+        if (chunk_id in inventory or not isinstance(checksum, str)
+                or not re.fullmatch(r"[0-9a-f]{64}", checksum)
+                or type(size) is not int or size < 0 or not valid_age):
+            return None
+        inventory[chunk_id] = chunk
+    return inventory
 

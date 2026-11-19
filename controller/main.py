@@ -10,6 +10,7 @@ from fastapi import Request
 from fastapi.responses import JSONResponse
 from errors import ApiError
 
+import janitor
 import reconcile
 import registry
 import upload
@@ -29,13 +30,17 @@ log = logging.getLogger("controller")
 async def lifespan(app: FastAPI):
     init_db()
     registry.mark_all_unknown()
+    janitor.clean_uploads(startup=True)
     stop = threading.Event()
     threading.Thread(target=registry.liveness_loop, args=(stop,), daemon=True).start()
+    threading.Thread(target=janitor.run, args=(stop,), daemon=True, name="janitor").start()
     log.info("controller ready (startup grace period active)")
     repair.start()
-    yield
-    repair.stop() 
-    stop.set()
+    try:
+        yield
+    finally:
+        stop.set()
+        repair.stop()
 
 
 app = FastAPI(lifespan=lifespan)

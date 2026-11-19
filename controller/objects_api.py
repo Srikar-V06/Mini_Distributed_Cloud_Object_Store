@@ -4,7 +4,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import Response
 from starlette.concurrency import run_in_threadpool
 
-from db import get_conn
+from db import get_conn, transaction
 from errors import ApiError
 from upload import now
 from validation import is_valid_id, parse_patch, parse_nonneg_int
@@ -128,20 +128,16 @@ def purge_from_workers(replicas):
     """Best effort. Dead workers are not even attempted (saves a 2s connect timeout each)."""
     def one(r):
         if r["wstatus"] != "alive" or not r["address"]:
-            return r
-        return None if delete_chunk(r["address"], r["chunk_id"]) else r
+            return None
+        if delete_chunk(r["address"], r["chunk_id"]):
+            return r["chunk_id"], r["worker_id"]
 
-    failed = [r for r in _cleanup_pool.map(one, replicas) if r is not None]
-    if failed:
-        conn = get_conn()
-        try:
-            with conn:
-                conn.executemany(
-                    "INSERT INTO pending_deletes(chunk_id, worker_id, created_at) VALUES (?,?,?)",
-                    [(r["chunk_id"], r["worker_id"], now()) for r in failed])
-        finally:
-            conn.close()
-        log.warning("%d chunk deletes deferred to pending_deletes", len(failed))
+    deleted = [key for key in _cleanup_pool.map(one, replicas) if key is not None]
+    if deleted:
+        with transaction() as conn:
+            conn.executemany("DELETE FROM pending_deletes WHERE chunk_id=? AND worker_id=?", deleted)
+    if len(deleted) < len(replicas):
+        log.warning("%d chunk deletes deferred to pending_deletes", len(replicas) - len(deleted))
 
 
 @router.delete("/api/v1/objects/{object_id}", status_code=204)
@@ -162,6 +158,8 @@ def delete_object(object_id: str):
             JOIN chunk_replicas cr ON cr.chunk_id = c.chunk_id
             LEFT JOIN workers w ON w.worker_id = cr.worker_id
             WHERE c.object_id = ?""", (object_id,))]      # capture BEFORE the cascade erases them
+        conn.executemany("INSERT OR IGNORE INTO pending_deletes VALUES (?,?,?)",
+                         [(r["chunk_id"], r["worker_id"], now()) for r in replicas])
         conn.execute("DELETE FROM objects WHERE object_id=?", (object_id,))   # cascades
         conn.commit()                     # <- the object is now gone for every client
     except Exception:
