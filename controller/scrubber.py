@@ -11,6 +11,7 @@ import repair
 from config import SCRUB_INTERVAL
 from db import get_conn, transaction, utc_now
 from errors import ApiError
+from event_log import event
 from signals import repair_wakeup
 from worker_client import scrub_worker
 
@@ -39,7 +40,9 @@ def _record(worker: dict, finding: dict, verified_at: str | None) -> bool:
         """, (state, utc_now(), cid, worker["worker_id"], verified_at,
               worker["worker_id"], worker["address"])).rowcount
     if updated:
-        log.warning("scrub marked %s on %s %s: %s", cid, worker["worker_id"], state, finding["reason"])
+        log.warning("scrub marked %s on %s %s: %s", cid, worker["worker_id"], state, finding["reason"],
+                    extra=event(f"replica_{state}", chunk_id=cid, worker_id=worker["worker_id"],
+                                detector="scrub", reason=finding["reason"]))
     return bool(updated)
 
 

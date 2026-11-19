@@ -5,10 +5,12 @@ import sqlite3
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from datetime import datetime, timezone
 
 import config
 from db import get_conn, transaction
+from event_log import event
 from placement import pick_workers
 from signals import repair_wakeup
 from upload import now
@@ -55,7 +57,12 @@ def _bump(key: str):
 
 def get_report() -> dict:
     with _report_lock:
-        return dict(_report)
+        monitor = dict(_report)
+        totals = dict(_totals)
+    failed = monitor.pop("failed_repairs", ())
+    _, chunks = load_chunk_view()
+    return {**monitor, **describe_replication(chunks, failed), "observed_at": now(),
+            "repairs_done": totals["repairs"], "trims_done": totals["trims"]}
 
 
 def read_verified(address, chunk_id, size, checksum):
@@ -78,7 +85,8 @@ def set_state(chunk_id, worker_id, state):
                          "WHERE chunk_id=? AND worker_id=?", (state, now(), chunk_id, worker_id))
     finally:
         conn.close()
-    log.warning("replica %s on %s marked %s", chunk_id, worker_id, state)
+    log.warning("replica %s on %s marked %s", chunk_id, worker_id, state,
+                extra=event(f"replica_{state}", chunk_id=chunk_id, worker_id=worker_id, detector="repair"))
 
 
 def queue_pending_delete(chunk_id, worker_id):
@@ -109,8 +117,8 @@ def record_replica(chunk_id, worker_id) -> bool:
 
 # ---------- snapshot and classification ----------
 SNAPSHOT_SQL = """
-SELECT c.chunk_id, c.size, c.checksum,
-       cr.worker_id, cr.state, w.status AS wstatus, w.address, w.last_heartbeat
+SELECT c.object_id, c.idx, c.chunk_id, c.size, c.checksum, cr.worker_id,
+       cr.state, cr.verified_at, w.status AS wstatus, w.address, w.last_heartbeat
 FROM chunks c
 JOIN objects o ON o.object_id = c.object_id AND o.status = 'complete'   -- skip uploading objects
 LEFT JOIN chunk_replicas cr ON cr.chunk_id = c.chunk_id
@@ -127,23 +135,52 @@ def load_snapshot():
             "SELECT worker_id, COUNT(*) AS n FROM chunk_replicas GROUP BY worker_id")}
     finally:
         conn.close()
-    chunks: dict[str, dict] = {}
+    return _group_chunks(rows), loads
+
+
+def load_chunk_view(object_id: str | None = None):
+    """Return a stable database view, including completed objects with zero chunks."""
+    with closing(get_conn()) as conn:
+        conn.execute("BEGIN")
+        obj = None
+        sql = SNAPSHOT_SQL
+        params = ()
+        if object_id is not None:
+            obj = conn.execute("""
+                SELECT object_id, size, checksum, num_chunks, created_at, modified_at FROM objects
+                WHERE object_id=? AND status='complete'
+            """, (object_id,)).fetchone()
+            if obj is None:
+                return None, {}
+            sql += " WHERE c.object_id=?"
+            params = (object_id,)
+        rows = conn.execute(sql + " ORDER BY c.object_id, c.idx, cr.worker_id", params).fetchall()
+    return obj, _group_chunks(rows)
+
+
+def _group_chunks(rows) -> dict:
+    chunks = {}
     for r in rows:
-        ch = chunks.setdefault(r["chunk_id"], {"chunk_id": r["chunk_id"], "size": r["size"],
+        ch = chunks.setdefault(r["chunk_id"], {"chunk_id": r["chunk_id"], "object_id": r["object_id"],
+                                               "index": r["idx"], "size": r["size"],
                                                "checksum": r["checksum"], "replicas": []})
         if r["worker_id"] is not None:
             ch["replicas"].append({"worker_id": r["worker_id"], "state": r["state"],
+                                   "verified_at": r["verified_at"],
                                    "wstatus": r["wstatus"], "address": r["address"],
                                    "age": _age(r["last_heartbeat"])})
-    return chunks, loads
+    return chunks
+
+
+def effective_replica_count(chunk) -> int:
+    return sum(r["state"] == "ok" and r["wstatus"] == "alive" for r in chunk["replicas"])
 
 
 def classify(ch) -> str:
     reps = ch["replicas"]
-    alive_ok = [r for r in reps if r["state"] == "ok" and r["wstatus"] == "alive"]
     dead_ok = [r for r in reps if r["state"] == "ok" and r["wstatus"] != "alive"]
     blips = [r for r in dead_ok if r["age"] <= BLIP_WINDOW]     # might come back soon
-    n = len(alive_ok)
+    n = effective_replica_count(ch)
     if n > RF:
         return "over"
     if n == RF:
@@ -153,6 +190,29 @@ def classify(ch) -> str:
     if n == 0:
         return "unavailable" if dead_ok else "unrecoverable"
     return "repair"
+
+
+def describe_replication(chunks: dict, failed_repairs) -> dict:
+    counts = dict(healthy=0, over_replicated=0, under_replicated=0, waiting=0,
+                  repair_pending=0, degraded=0, unavailable=0, unrecoverable=0)
+    affected = {"degraded": [], "unavailable": [], "unrecoverable": []}
+    details = []
+    for cid, ch in chunks.items():
+        state = classify(ch)
+        if state == "repair":
+            state = "degraded" if cid in failed_repairs else "repair_pending"
+        elif state == "over":
+            state = "over_replicated"
+        effective = effective_replica_count(ch)
+        counts[state] += 1
+        counts["under_replicated"] += effective < RF
+        if state in affected:
+            affected[state].append(cid)
+        details.append({"chunk_id": cid, "object_id": ch["object_id"], "index": ch["index"],
+                        "effective_replicas": effective, "status": state})
+    return {**counts, "replication_factor": RF, "total_chunks": len(chunks), "chunks": details,
+            **{f"{state}_chunks": ids for state, ids in affected.items()},
+            "sample": {state: ids[:20] for state, ids in affected.items()}}
 
 
 # ---------- repair one chunk ----------
@@ -198,9 +258,12 @@ def repair_chunk(ch) -> str:
             break                                                      # no eligible target: degraded
         tried.add(target["worker_id"])
         log.info("chunk %s under-replicated (%d/%d): copying %s -> %s",
-                 cid, good + len(repaired), RF, src["worker_id"], target["worker_id"])
+                 cid, good + len(repaired), RF, src["worker_id"], target["worker_id"],
+                 extra=event("repair_started", chunk_id=cid, source_worker_id=src["worker_id"],
+                             target_worker_id=target["worker_id"]))
         if not send_chunk(target, cid, data, ch["checksum"]):          # worker verifies before 201
-            log.warning("copy of %s to %s failed, trying another target", cid, target["worker_id"])
+            log.warning("copy of %s to %s failed, trying another target", cid, target["worker_id"],
+                        extra=event("repair_write_failed", chunk_id=cid, target_worker_id=target["worker_id"]))
             continue
         if not record_replica(cid, target["worker_id"]):               # row only AFTER verification
             if not delete_chunk(target["address"], cid):               # object deleted mid-copy
@@ -208,6 +271,9 @@ def repair_chunk(ch) -> str:
             return "deleted"
         repaired.add(target["worker_id"])
         _bump("repairs")
+        log.info("stored repaired copy of %s on %s", cid, target["worker_id"],
+                 extra=event("replica_repaired", chunk_id=cid, source_worker_id=src["worker_id"],
+                             target_worker_id=target["worker_id"]))
     if len(repaired) < need:
         return "degraded"
     for replica in reps:
@@ -250,7 +316,8 @@ def trim_chunk(ch, loads) -> str:
 
     for e in extras:                       # extras come from the most-loaded workers
         if remove_replica(cid, e):
-            log.info("chunk %s over-replicated: removed extra copy from %s", cid, e["worker_id"])
+            log.info("chunk %s over-replicated: removed extra copy from %s", cid, e["worker_id"],
+                     extra=event("replica_trimmed", chunk_id=cid, worker_id=e["worker_id"]))
             _bump("trims")
     return "trimmed"
 
@@ -276,66 +343,41 @@ def run_cycle(pool):
     t0 = time.monotonic()
     chunks, loads = load_snapshot()
 
-    classes, futures = {}, {}
+    repairs, trims = {}, []
     for cid, ch in chunks.items():
         cls = classify(ch)
-        classes[cid] = cls
         if cls == "repair":
-            futures[cid] = pool.submit(run_guarded, cid, repair_chunk, ch)
+            repairs[cid] = pool.submit(run_guarded, cid, repair_chunk, ch)
         elif cls == "over":
-            futures[cid] = pool.submit(run_guarded, cid, trim_chunk, ch, loads)
-    results = {cid: f.result() for cid, f in futures.items()}
-
-    # counts AFTER the work, so the report shows where the system stands now
-    c = dict(healthy=0, over=0, under=0, waiting=0, degraded=0, unavailable=0, unrecoverable=0)
-    samples = {"degraded": [], "unavailable": [], "unrecoverable": []}
-    for cid, cls in classes.items():
-        res = results.get(cid)
-        if cls == "healthy":
-            c["healthy"] += 1
-        elif cls == "waiting":
-            c["waiting"] += 1; c["under"] += 1
-        elif cls in ("unavailable", "unrecoverable"):
-            c[cls] += 1; c["under"] += 1
-            if len(samples[cls]) < 20:
-                samples[cls].append(cid)
-        elif cls == "repair":
-            if res in ("repaired", "deleted"):
-                c["healthy"] += 1
-            else:
-                c["degraded"] += 1; c["under"] += 1
-                if len(samples["degraded"]) < 20:
-                    samples["degraded"].append(cid)
-        elif cls == "over":
-            if res == "trimmed":
-                c["healthy"] += 1
-            else:
-                c["over"] += 1
+            trims.append(pool.submit(run_guarded, cid, trim_chunk, ch, loads))
+    failed = frozenset(cid for cid, job in repairs.items() if job.result() in ("degraded", "no_source", "error"))
+    for job in trims:
+        job.result()
 
     global _report
     with _report_lock:
         _report = {"state": "running", "at": now(), "cycle_ms": round((time.monotonic() - t0) * 1000),
-                   "total_chunks": len(chunks), "healthy": c["healthy"],
-                   "over_replicated": c["over"], "under_replicated": c["under"],
-                   "waiting": c["waiting"], "degraded": c["degraded"],
-                   "unavailable": c["unavailable"], "unrecoverable": c["unrecoverable"],
-                   "repairs_done": _totals["repairs"], "trims_done": _totals["trims"],
-                   "sample": samples}
-    _log_summary(c)
+                   "failed_repairs": failed}
+    if repairs or trims:
+        _, chunks = load_chunk_view()
+    _log_summary(describe_replication(chunks, failed))
 
 
 def _log_summary(c):
     """One line per CHANGE in the degraded picture, never one line per chunk per cycle."""
     global _last_summary
-    key = (c["waiting"], c["degraded"], c["unavailable"], c["unrecoverable"])
+    counts = {state: c[state] for state in (
+        "over_replicated", "waiting", "repair_pending", "degraded", "unavailable", "unrecoverable"
+    )}
+    key = tuple(counts.values())
     if key == _last_summary:
         return
     _last_summary = key
     if any(key):
-        log.warning("replication not at target: waiting=%d degraded(no eligible target)=%d "
-                    "unavailable=%d unrecoverable=%d", *key)
+        log.warning("replication not at target: %s", counts, extra=event("replication_status", **counts))
     else:
-        log.info("replication healthy: every chunk has %d verified copies", RF)
+        log.info("replication healthy: every chunk has %d effective copies", RF,
+                 extra=event("replication_healthy", replication_factor=RF))
 
 
 # ---------- thread lifecycle ----------

@@ -7,6 +7,7 @@ from starlette.datastructures import MutableHeaders
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from errors import ApiError
+from event_log import JsonFormatter, event
 
 log = logging.getLogger("http")
 request_id_var = contextvars.ContextVar("request_id", default="-")
@@ -33,7 +34,7 @@ def setup_logging():
     root = logging.getLogger()
     if not root.handlers:
         logging.basicConfig(level=logging.INFO)
-    fmt = logging.Formatter("%(asctime)s %(levelname)s [%(request_id)s] %(name)s: %(message)s")
+    fmt = JsonFormatter()
     for h in root.handlers:
         h.addFilter(RequestIdFilter())
         h.setFormatter(fmt)
@@ -69,7 +70,9 @@ class RequestIdMiddleware:
             ms = (time.monotonic() - started) * 1000
             level = logging.DEBUG if scope["path"] in QUIET_PATHS else logging.INFO
             log.log(level, "%s %s -> %s %.0fms%s", scope["method"], scope["path"], status, ms,
-                    " (exception)" if failed else "")
+                    " (exception)" if failed else "",
+                    extra=event("http_request", method=scope["method"], path=scope["path"],
+                                status=status, duration_ms=round(ms), failed=failed))
             request_id_var.reset(token)
 
 

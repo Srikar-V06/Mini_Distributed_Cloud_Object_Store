@@ -6,6 +6,7 @@ from contextlib import closing
 import config
 import repair
 from db import get_conn, transaction, utc_now
+from event_log import event
 from signals import repair_wakeup
 from worker_client import delete_chunk, list_worker_chunks
 
@@ -63,6 +64,7 @@ def retry_pending_deletes(worker_id: str | None = None) -> None:
 def _update_expected(worker_id: str, address: str, expected: dict, inventory: dict) -> dict:
     """Apply inventory results only to replica rows unchanged since before the HTTP call."""
     counts = {"ok": 0, "corrupt": 0, "lost": 0}
+    changed = []
     verified_at = utc_now()
     with transaction() as conn:
         if _worker_address(conn, worker_id) != address:
@@ -84,6 +86,11 @@ def _update_expected(worker_id: str, address: str, expected: dict, inventory: di
                                   WHERE chunk_id=? AND worker_id=?)""",
                 (state, verified_at, cid, worker_id, row["state"], row["verified_at"], cid, worker_id))
             counts[state] += result.rowcount
+            if result.rowcount and state != "ok" and state != row["state"]:
+                changed.append((cid, state))
+    for cid, state in changed:
+        log.warning("rejoin marked %s on %s %s", cid, worker_id, state,
+                    extra=event(f"replica_{state}", chunk_id=cid, worker_id=worker_id, detector="rejoin"))
     return counts
 
 
@@ -147,7 +154,8 @@ def _reconcile(worker_id: str) -> None:
 
     inventory = list_worker_chunks(address, worker_id)
     if inventory is None:
-        log.warning("inventory unavailable for %s; reconciliation will retry", worker_id)
+        log.warning("inventory unavailable for %s; reconciliation will retry", worker_id,
+                    extra=event("worker_inventory_failed", worker_id=worker_id))
         _retry(worker_id, config.JANITOR_INTERVAL)
         return
 
@@ -166,7 +174,8 @@ def _reconcile(worker_id: str) -> None:
             counts["orphans_queued"] = counts.get("orphans_queued", 0) + 1
 
     repair_wakeup.set()
-    log.info("reconciled worker %s: %s", worker_id, counts)
+    log.info("reconciled worker %s: %s", worker_id, counts,
+             extra=event("worker_reconciled", worker_id=worker_id, counts=counts))
 
 
 def reconcile_worker(worker_id: str) -> None:
