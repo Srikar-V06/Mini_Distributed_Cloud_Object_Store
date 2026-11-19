@@ -3,3 +3,8 @@ docker-compose.override.yml
 *.bin
 bad.json
 meta.json
+
+empty.json
+p*.json
+patch.json
+same.json
