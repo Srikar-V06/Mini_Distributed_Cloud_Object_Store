@@ -5,6 +5,7 @@ import threading
 
 from config import DEAD_AFTER, REPAIR_DELAY, LIVENESS_INTERVAL
 from db import get_conn, transaction, utc_now
+from event_log import event
 
 log = logging.getLogger("controller.registry")
 
@@ -45,7 +46,9 @@ def register(worker_id: str, address: str, chunk_count: int, bytes_used: int) ->
             (worker_id, address, now, chunk_count, bytes_used),
         )
     prev = row["status"] if row else "new"
-    log.info("worker %s registered at %s (previous status: %s)", worker_id, address, prev)
+    log.info("worker %s registered at %s (previous status: %s)", worker_id, address, prev,
+             extra=event("worker_registered" if prev == "new" else "worker_rejoined",
+                         worker_id=worker_id, status="alive", previous_status=prev, via="registration"))
     return prev
 
 
@@ -63,7 +66,9 @@ def heartbeat(worker_id: str, chunk_count: int, bytes_used: int) -> str | None:
         )
     prev = row["status"]
     if prev != "alive":
-        log.info("worker %s is ALIVE again (was %s)", worker_id, prev)
+        log.info("worker %s is ALIVE again (was %s)", worker_id, prev,
+                 extra=event("worker_rejoined", worker_id=worker_id, status="alive",
+                             previous_status=prev, via="heartbeat"))
     return prev
 
 
@@ -82,7 +87,8 @@ def sweep() -> None:
             c.executemany("UPDATE workers SET status='dead' WHERE worker_id=?",
                           [(w,) for w in dead])
     for w in dead:
-        log.warning("worker %s marked DEAD (no heartbeat for >%ss)", w, DEAD_AFTER)
+        log.warning("worker %s marked DEAD (no heartbeat for >%ss)", w, DEAD_AFTER,
+                    extra=event("worker_dead", worker_id=w, status="dead", timeout_seconds=DEAD_AFTER))
 
 
 def liveness_loop(stop: threading.Event) -> None:

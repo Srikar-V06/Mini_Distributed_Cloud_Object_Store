@@ -1,11 +1,13 @@
-import logging, random, re
+import hashlib, logging, random, re
 from itertools import chain
 from urllib.parse import quote
 from fastapi import APIRouter
 from fastapi.responses import Response, StreamingResponse
+from starlette.background import BackgroundTask
 
 from db import get_conn
 from errors import ApiError
+from event_log import event
 from repair import read_verified
 from signals import repair_wakeup
 from upload import now
@@ -104,7 +106,8 @@ def mark_replica(chunk_id: str, worker_id: str, state: str, verified_at: str | N
     finally:
         conn.close()
     if updated:
-        log.warning("replica %s on %s marked %s", chunk_id, worker_id, state)
+        log.warning("replica %s on %s marked %s", chunk_id, worker_id, state,
+                    extra=event(f"replica_{state}", chunk_id=chunk_id, worker_id=worker_id, detector="download"))
         repair_wakeup.set()
 
 
@@ -124,7 +127,8 @@ def stream_chunks(chunks):
             else:                             # unreachable: do NOT change DB, heartbeats decide
                 skip.add(cand["worker_id"])
         if data is None:
-            log.error("download aborted: no readable copy of %s", chunk_id)
+            log.error("download aborted: no readable copy of %s", chunk_id,
+                      extra=event("chunk_unreadable", chunk_id=chunk_id))
             raise StreamAborted(chunk_id)
         yield data
 
@@ -132,6 +136,21 @@ def stream_chunks(chunks):
 def content_disposition(name: str) -> str:
     fallback = re.sub(r"[^A-Za-z0-9._-]", "_", name) or "download"
     return f"attachment; filename=\"{fallback}\"; filename*=UTF-8''{quote(name, safe='')}"
+
+
+def log_download(object_id: str, size: int, checksum: str) -> None:
+    log.info("streamed object %s", object_id,
+             extra=event("object_downloaded", object_id=object_id, size=size, checksum=checksum))
+
+
+def track_download(object_id: str, stream):
+    digest = hashlib.sha256()
+    size = 0
+    for data in stream:
+        digest.update(data)
+        size += len(data)
+        yield data
+    log_download(object_id, size, digest.hexdigest())
 
 
 @router.get("/api/v1/objects/{object_id}")
@@ -144,7 +163,8 @@ def download_object(object_id: str):
         "X-Object-Checksum": obj["checksum"],
     }
     if obj["num_chunks"] == 0:
-        return Response(content=b"", media_type=obj["content_type"], headers=headers)
+        return Response(content=b"", media_type=obj["content_type"], headers=headers,
+                        background=BackgroundTask(log_download, object_id, 0, hashlib.sha256(b"").hexdigest()))
 
     chunks = preflight(object_id, obj["num_chunks"])      # may raise 404/500/503
     stream = stream_chunks(chunks)
@@ -154,5 +174,5 @@ def download_object(object_id: str):
         # Read failures may have changed replica states since the initial preflight.
         preflight(object_id, obj["num_chunks"])
         raise ApiError(503, "data_unavailable", "no replica responded for the first chunk") from None
-    return StreamingResponse(chain((first,), stream),
+    return StreamingResponse(track_download(object_id, chain((first,), stream)),
                              media_type=obj["content_type"], headers=headers)

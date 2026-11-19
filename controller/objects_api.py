@@ -6,6 +6,7 @@ from starlette.concurrency import run_in_threadpool
 
 from db import get_conn, transaction
 from errors import ApiError
+from event_log import event
 from upload import now
 from validation import is_valid_id, parse_patch, parse_nonneg_int
 from worker_client import delete_chunk
@@ -93,6 +94,11 @@ def apply_patch(object_id: str, raw: bytes):
         raise
     finally:
         conn.close()
+    log.info("patched metadata for %s", object_id,
+             extra=event("metadata_patched", object_id=object_id, modified_at=modified_at,
+                         added=len(after.keys() - existing.keys()),
+                         updated=sum(after[k] != existing[k] for k in after.keys() & existing.keys()),
+                         removed=len(existing.keys() - after.keys())))
     return {"object_id": object_id, "modified_at": modified_at,
             "custom": {k: json.loads(v) for k, v in after.items()}}
 
@@ -169,4 +175,6 @@ def delete_object(object_id: str):
         conn.close()
 
     purge_from_workers(replicas)          # slow part happens after the commit
+    log.info("deleted object %s", object_id,
+             extra=event("object_deleted", object_id=object_id, replica_count=len(replicas)))
     return Response(status_code=204)

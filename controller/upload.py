@@ -6,6 +6,7 @@ from fastapi import APIRouter, File, Form, UploadFile
 from config import *
 from db import get_conn
 from errors import ApiError, ReplicationError
+from event_log import event
 from placement import pick_workers, count_alive
 from validation import sanitize_filename, parse_metadata
 from worker_client import send_chunk, delete_chunk
@@ -145,6 +146,9 @@ def upload_object(file: UploadFile = File(None), metadata: str = Form(None)):
         finally:
             conn.close()
 
+        log.info("stored object %s", object_id,
+                 extra=event("object_uploaded", object_id=object_id, size=total,
+                             num_chunks=idx, checksum=checksum))
         return {"object_id": object_id, "name": name, "size": total,
                 "content_type": content_type, "checksum": checksum,
                 "num_chunks": idx, "created_at": ts, "metadata": custom_md}
