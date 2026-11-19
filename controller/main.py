@@ -13,6 +13,7 @@ from errors import ApiError
 import reconcile
 import registry
 import upload
+import download
 from db import init_db
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -32,7 +33,8 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
-
+app.include_router(upload.router)
+app.include_router(download.router)
 
 class HeartbeatBody(BaseModel):
     worker_id: str = Field(pattern=r"^[A-Za-z0-9_-]+$", max_length=64)
@@ -77,4 +79,3 @@ def admin_workers():
 async def api_error_handler(request: Request, exc: ApiError):
     return JSONResponse(status_code=exc.status,
                         content={"error": exc.code, "message": exc.message})
-app.include_router(upload.router)

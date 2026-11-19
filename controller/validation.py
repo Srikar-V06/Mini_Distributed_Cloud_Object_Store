@@ -1,5 +1,6 @@
 import json
 from errors import ApiError
+import re
 
 def sanitize_filename(name: str | None) -> str:
     if not name:
@@ -28,3 +29,7 @@ def parse_metadata(raw: str | None) -> dict:
         if isinstance(v, str) and len(v) > 1024:
             raise ApiError(400, "invalid_metadata", f"value for '{k}' exceeds 1024 chars")
     return md
+ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+def is_valid_id(s: str) -> bool:
+    return bool(ID_RE.fullmatch(s))
