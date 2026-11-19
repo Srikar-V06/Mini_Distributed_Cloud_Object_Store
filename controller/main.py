@@ -13,6 +13,7 @@ from errors import ApiError
 import janitor
 import reconcile
 import registry
+import scrubber
 import upload
 import download
 import os
@@ -34,6 +35,7 @@ async def lifespan(app: FastAPI):
     stop = threading.Event()
     threading.Thread(target=registry.liveness_loop, args=(stop,), daemon=True).start()
     threading.Thread(target=janitor.run, args=(stop,), daemon=True, name="janitor").start()
+    threading.Thread(target=scrubber.run, args=(stop,), daemon=True, name="scrubber").start()
     log.info("controller ready (startup grace period active)")
     repair.start()
     try:
@@ -48,6 +50,7 @@ app.include_router(upload.router)
 app.include_router(download.router)
 app.include_router(objects_api.router)
 app.include_router(admin_replication.router)
+app.include_router(scrubber.router)
 install_error_handling(app)
 
 class HeartbeatBody(BaseModel):

@@ -1,6 +1,8 @@
 import os
 import sqlite3
-from contextlib import contextmanager
+import tempfile
+import time
+from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 
 DB_PATH = os.getenv("DB_PATH", "/meta/controller.db")
@@ -51,3 +53,24 @@ def init_db() -> None:
         conn.executescript(schema)
     finally:
         conn.close()
+
+
+def backup_if_due(interval: float) -> bool:
+    """Publish one consistent online backup, replacing it only after success."""
+    target = DB_PATH + ".backup"
+    try:
+        if time.time() - os.path.getmtime(target) < interval:
+            return False
+    except FileNotFoundError:
+        pass
+
+    fd, temp = tempfile.mkstemp(prefix=".controller-backup-", dir=os.path.dirname(target))
+    os.close(fd)
+    try:
+        with closing(get_conn()) as source, closing(sqlite3.connect(temp)) as destination:
+            source.backup(destination, pages=128)
+        os.replace(temp, target)
+    finally:
+        if os.path.exists(temp):
+            os.unlink(temp)
+    return True

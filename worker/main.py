@@ -105,8 +105,11 @@ def list_chunks(worker_id: str):
 
 
 @app.post("/internal/scrub")
-def scrub():
-    result = storage.scrub(SCRUB_SLEEP)
+def scrub(expected: dict[str, str] | None = None):
+    if expected is not None and any(not storage.valid_id(cid) or not storage.HEX64.fullmatch(digest)
+                                    for cid, digest in expected.items()):
+        return err(400, "invalid_scrub_request", "expected valid chunk IDs and SHA-256 checksums")
+    result = storage.scrub(SCRUB_SLEEP, expected)
     if result["bad"]:
         log.warning("scrub found %d bad chunks: %s", len(result["bad"]), result["bad"])
     return result

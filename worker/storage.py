@@ -150,16 +150,20 @@ def stats() -> dict:
     }
 
 
-def scrub(sleep_between: float = 0.0) -> dict:
+def scrub(sleep_between: float = 0.0, expected: dict[str, str] | None = None) -> dict:
     bad, checked = [], 0
-    for e in _chunk_files():
+    chunk_ids = expected if expected is not None else (e.name for e in _chunk_files())
+    for chunk_id in chunk_ids:
         checked += 1
         try:
-            read_verified(e.name)
+            _, digest = read_verified(chunk_id)
+            if expected is not None and digest != expected[chunk_id]:
+                raise ChunkCorrupt("hash differs from controller checksum")
         except ChunkCorrupt as ex:
-            bad.append({"chunk_id": e.name, "reason": str(ex)})
+            bad.append({"chunk_id": chunk_id, "state": "corrupt", "reason": str(ex)})
         except ChunkMissing:
-            pass  # deleted while scrubbing
+            if expected is not None:
+                bad.append({"chunk_id": chunk_id, "state": "lost", "reason": "file missing"})
         if sleep_between:
             time.sleep(sleep_between)
     return {"checked": checked, "bad": bad}
