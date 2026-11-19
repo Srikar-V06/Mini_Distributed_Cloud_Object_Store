@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 
 import config
 import reconcile
-from db import transaction, utc_now
+from db import backup_if_due, transaction, utc_now
 from upload import active_uploads
 
 log = logging.getLogger("controller.janitor")
@@ -39,3 +39,8 @@ def run(stop: threading.Event) -> None:
             reconcile.retry_due_reconciliations()
         except Exception:
             log.exception("janitor cycle failed")
+        try:
+            if backup_if_due(config.DB_BACKUP_INTERVAL):
+                log.info("saved controller metadata backup")
+        except Exception:
+            log.exception("controller metadata backup failed")

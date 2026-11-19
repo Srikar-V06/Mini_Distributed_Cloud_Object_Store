@@ -43,7 +43,7 @@ def _age(ts):
     return (datetime.now(timezone.utc) - dt).total_seconds()
 
 
-def is_inflight(chunk_id: str) -> bool:        # Step 12's scrubber will call this
+def is_inflight(chunk_id: str) -> bool:
     with _inflight_lock:
         return chunk_id in _inflight
 
@@ -191,14 +191,14 @@ def repair_chunk(ch) -> str:
     need = RF - good
     tried = {r["worker_id"] for r in reps if r["state"] == "ok"}      # never target a current holder
     inplace = [r for r in reps if r["state"] != "ok" and r["wstatus"] == "alive"]
-    made = 0
-    while made < need:
+    repaired = set()
+    while len(repaired) < need:
         target = next_target(inplace, tried)
         if target is None:
             break                                                      # no eligible target: degraded
         tried.add(target["worker_id"])
         log.info("chunk %s under-replicated (%d/%d): copying %s -> %s",
-                 cid, good + made, RF, src["worker_id"], target["worker_id"])
+                 cid, good + len(repaired), RF, src["worker_id"], target["worker_id"])
         if not send_chunk(target, cid, data, ch["checksum"]):          # worker verifies before 201
             log.warning("copy of %s to %s failed, trying another target", cid, target["worker_id"])
             continue
@@ -206,12 +206,33 @@ def repair_chunk(ch) -> str:
             if not delete_chunk(target["address"], cid):               # object deleted mid-copy
                 queue_pending_delete(cid, target["worker_id"])
             return "deleted"
-        made += 1
+        repaired.add(target["worker_id"])
         _bump("repairs")
-    return "repaired" if made >= need else "degraded"
+    if len(repaired) < need:
+        return "degraded"
+    for replica in reps:
+        if replica["worker_id"] not in repaired:
+            if remove_replica(cid, replica, bad_only=True):
+                log.info("removed bad replica of %s on %s after repair", cid, replica["worker_id"])
+    return "repaired"
 
 
 # ---------- trim one over-replicated chunk ----------
+def remove_replica(cid, replica, *, bad_only=False) -> bool:
+    key = (cid, replica["worker_id"])
+    sql = "DELETE FROM chunk_replicas WHERE chunk_id=? AND worker_id=?"
+    if bad_only:
+        sql += " AND state!='ok'"
+    with transaction() as conn:
+        if not conn.execute(sql, key).rowcount:
+            return False
+        conn.execute("INSERT OR IGNORE INTO pending_deletes VALUES (?,?,?)", (*key, now()))
+    if replica["wstatus"] == "alive" and delete_chunk(replica["address"], cid):
+        with transaction() as conn:
+            conn.execute("DELETE FROM pending_deletes WHERE chunk_id=? AND worker_id=?", key)
+    return True
+
+
 def trim_chunk(ch, loads) -> str:
     cid = ch["chunk_id"]
     alive_ok = [r for r in ch["replicas"] if r["state"] == "ok" and r["wstatus"] == "alive"]
@@ -228,15 +249,9 @@ def trim_chunk(ch, loads) -> str:
             return "skipped"
 
     for e in extras:                       # extras come from the most-loaded workers
-        key = (cid, e["worker_id"])
-        with transaction() as conn:
-            conn.execute("DELETE FROM chunk_replicas WHERE chunk_id=? AND worker_id=?", key)
-            conn.execute("INSERT OR IGNORE INTO pending_deletes VALUES (?,?,?)", (*key, now()))
-        if delete_chunk(e["address"], cid):
-            with transaction() as conn:
-                conn.execute("DELETE FROM pending_deletes WHERE chunk_id=? AND worker_id=?", key)
-        log.info("chunk %s over-replicated: removed extra copy from %s", cid, e["worker_id"])
-        _bump("trims")
+        if remove_replica(cid, e):
+            log.info("chunk %s over-replicated: removed extra copy from %s", cid, e["worker_id"])
+            _bump("trims")
     return "trimmed"
 
 

@@ -14,3 +14,6 @@ REPAIR_PARALLELISM = int(os.getenv("REPAIR_PARALLELISM", "4"))  # concurrent chu
 JANITOR_INTERVAL = float(os.getenv("JANITOR_INTERVAL", "30"))
 STALE_UPLOAD_AGE = float(os.getenv("STALE_UPLOAD_AGE", "60"))
 ORPHAN_MIN_AGE = float(os.getenv("ORPHAN_MIN_AGE", "600"))
+SCRUB_INTERVAL = float(os.getenv("SCRUB_INTERVAL", "300"))
+SCRUB_READ_TIMEOUT = float(os.getenv("SCRUB_READ_TIMEOUT", "120"))
+DB_BACKUP_INTERVAL = float(os.getenv("DB_BACKUP_INTERVAL", "86400"))

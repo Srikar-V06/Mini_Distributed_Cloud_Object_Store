@@ -3,9 +3,10 @@ import re
 from urllib.parse import quote
 
 import httpx
-from config import WORKER_CONNECT_TIMEOUT, WORKER_READ_TIMEOUT
+from config import SCRUB_READ_TIMEOUT, WORKER_CONNECT_TIMEOUT, WORKER_READ_TIMEOUT
 
 _timeout = httpx.Timeout(WORKER_READ_TIMEOUT, connect=WORKER_CONNECT_TIMEOUT)
+_scrub_timeout = httpx.Timeout(SCRUB_READ_TIMEOUT, connect=WORKER_CONNECT_TIMEOUT)
 
 def send_chunk(worker: dict, chunk_id: str, data: bytes, checksum: str) -> bool:
     """True only on 201. Any timeout, 5xx, 507 or 422 counts as failure."""
@@ -80,4 +81,24 @@ def list_worker_chunks(address: str, worker_id: str) -> dict[str, dict] | None:
             return None
         inventory[chunk_id] = chunk
     return inventory
+
+
+def scrub_worker(address: str, expected: dict[str, str]) -> list[dict]:
+    response = httpx.post(f"{address}/internal/scrub", json=expected, timeout=_scrub_timeout)
+    response.raise_for_status()
+    payload = response.json()
+    if (not isinstance(payload, dict) or payload.get("checked") != len(expected)
+            or not isinstance(payload.get("bad"), list)):
+        raise ValueError("invalid scrub response")
+    bad = {}
+    for entry in payload["bad"]:
+        if not isinstance(entry, dict):
+            raise ValueError("invalid scrub finding")
+        cid = entry.get("chunk_id")
+        if (not isinstance(cid, str) or cid not in expected or cid in bad
+                or entry.get("state") not in ("corrupt", "lost")
+                or not isinstance(entry.get("reason"), str)):
+            raise ValueError("invalid scrub finding")
+        bad[cid] = entry
+    return list(bad.values())
 

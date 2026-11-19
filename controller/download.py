@@ -1,14 +1,15 @@
-import hashlib, logging, random, re
+import logging, random, re
+from itertools import chain
 from urllib.parse import quote
 from fastapi import APIRouter
 from fastapi.responses import Response, StreamingResponse
 
 from db import get_conn
 from errors import ApiError
+from repair import read_verified
 from signals import repair_wakeup
 from upload import now
 from validation import is_valid_id
-from worker_client import fetch_chunk
 
 log = logging.getLogger("download")
 router = APIRouter()
@@ -81,7 +82,7 @@ def ordered_candidates(chunk_id: str, skip: set):
     conn = get_conn()
     try:
         rows = conn.execute("""
-            SELECT cr.worker_id, w.address
+            SELECT cr.worker_id, cr.verified_at, w.address
             FROM chunk_replicas cr JOIN workers w ON w.worker_id = cr.worker_id
             WHERE cr.chunk_id = ? AND cr.state = 'ok' AND w.status = 'alive'""",
             (chunk_id,)).fetchall()
@@ -93,17 +94,18 @@ def ordered_candidates(chunk_id: str, skip: set):
     return cands
 
 
-def mark_replica(chunk_id: str, worker_id: str, state: str):
+def mark_replica(chunk_id: str, worker_id: str, state: str, verified_at: str | None):
     conn = get_conn()
     try:
         with conn:
-            conn.execute("UPDATE chunk_replicas SET state=?, verified_at=? "
-                         "WHERE chunk_id=? AND worker_id=?",
-                         (state, now(), chunk_id, worker_id))
+            updated = conn.execute("UPDATE chunk_replicas SET state=?, verified_at=? "
+                                   "WHERE chunk_id=? AND worker_id=? AND state='ok' AND verified_at IS ?",
+                                   (state, now(), chunk_id, worker_id, verified_at)).rowcount
     finally:
         conn.close()
-    log.warning("replica %s on %s marked %s", chunk_id, worker_id, state)
-    repair_wakeup.set()
+    if updated:
+        log.warning("replica %s on %s marked %s", chunk_id, worker_id, state)
+        repair_wakeup.set()
 
 
 def stream_chunks(chunks):
@@ -111,17 +113,14 @@ def stream_chunks(chunks):
     for chunk_id, size, checksum in chunks:
         data = None
         for cand in ordered_candidates(chunk_id, skip):
-            status, payload = fetch_chunk(cand["address"], chunk_id)
+            status, payload = read_verified(cand["address"], chunk_id, size, checksum)
             if status == "ok":
-                # verify against the controller's DB (source of truth) BEFORE yielding
-                if len(payload) == size and hashlib.sha256(payload).hexdigest() == checksum:
-                    data = payload
-                    break
-                status = "corrupt"            # wrong length or hash counts as corrupt
+                data = payload
+                break
             if status == "corrupt":
-                mark_replica(chunk_id, cand["worker_id"], "corrupt")
+                mark_replica(chunk_id, cand["worker_id"], "corrupt", cand["verified_at"])
             elif status == "missing":
-                mark_replica(chunk_id, cand["worker_id"], "lost")
+                mark_replica(chunk_id, cand["worker_id"], "lost", cand["verified_at"])
             else:                             # unreachable: do NOT change DB, heartbeats decide
                 skip.add(cand["worker_id"])
         if data is None:
@@ -148,5 +147,12 @@ def download_object(object_id: str):
         return Response(content=b"", media_type=obj["content_type"], headers=headers)
 
     chunks = preflight(object_id, obj["num_chunks"])      # may raise 404/500/503
-    return StreamingResponse(stream_chunks(chunks),
+    stream = stream_chunks(chunks)
+    try:
+        first = next(stream)
+    except StreamAborted:
+        # Read failures may have changed replica states since the initial preflight.
+        preflight(object_id, obj["num_chunks"])
+        raise ApiError(503, "data_unavailable", "no replica responded for the first chunk") from None
+    return StreamingResponse(chain((first,), stream),
                              media_type=obj["content_type"], headers=headers)
