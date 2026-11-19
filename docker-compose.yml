@@ -20,6 +20,7 @@ services:
       PYTHONUNBUFFERED: "1"
       DEAD_AFTER: "10"
       REPAIR_DELAY: "15"
+      DEBUG_ROUTES: "1"
 
   worker1:
     <<: *worker

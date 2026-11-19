@@ -53,8 +53,7 @@ def get_metadata(object_id: str):
 
 
 # ---------- PATCH metadata ----------
-def apply_patch(object_id: str, raw: bytes):
-    patch = parse_patch(raw)                                  # 400s first
+def apply_patch(object_id: str, raw: bytes):                                  
     conn = get_conn()
     try:
         conn.execute("BEGIN IMMEDIATE")   # take the write lock now: concurrent PATCHes serialize here
@@ -62,6 +61,7 @@ def apply_patch(object_id: str, raw: bytes):
                            (object_id,)).fetchone()
         if obj is None:
             raise ApiError(404, "not_found", "object not found")
+        patch = parse_patch(raw)
 
         existing = {r["key"]: r["value_json"] for r in conn.execute(
             "SELECT key, value_json FROM object_metadata WHERE object_id=?", (object_id,))}
