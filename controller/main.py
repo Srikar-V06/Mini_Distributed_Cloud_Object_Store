@@ -14,6 +14,7 @@ import reconcile
 import registry
 import upload
 import download
+import objects_api
 from db import init_db
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -35,6 +36,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 app.include_router(upload.router)
 app.include_router(download.router)
+app.include_router(objects_api.router)
 
 class HeartbeatBody(BaseModel):
     worker_id: str = Field(pattern=r"^[A-Za-z0-9_-]+$", max_length=64)
