@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 import config
-from db import get_conn
+from db import get_conn, transaction
 from placement import pick_workers
 from signals import repair_wakeup
 from upload import now
@@ -85,7 +85,7 @@ def queue_pending_delete(chunk_id, worker_id):
     conn = get_conn()
     try:
         with conn:
-            conn.execute("INSERT INTO pending_deletes(chunk_id, worker_id, created_at) VALUES (?,?,?)",
+            conn.execute("INSERT OR IGNORE INTO pending_deletes(chunk_id, worker_id, created_at) VALUES (?,?,?)",
                          (chunk_id, worker_id, now()))
     finally:
         conn.close()
@@ -93,19 +93,18 @@ def queue_pending_delete(chunk_id, worker_id):
 
 def record_replica(chunk_id, worker_id) -> bool:
     """Upsert an 'ok' row. False if the chunk vanished meanwhile (object deleted mid-repair)."""
-    conn = get_conn()
     try:
-        with conn:
+        with transaction() as conn:
             conn.execute("""INSERT INTO chunk_replicas(chunk_id, worker_id, state, verified_at)
                             VALUES (?,?, 'ok', ?)
                             ON CONFLICT(chunk_id, worker_id)
                             DO UPDATE SET state='ok', verified_at=excluded.verified_at""",
                          (chunk_id, worker_id, now()))
+            conn.execute("DELETE FROM pending_deletes WHERE chunk_id=? AND worker_id=?",
+                         (chunk_id, worker_id))
         return True
     except sqlite3.IntegrityError:        # foreign key: the chunk row is gone
         return False
-    finally:
-        conn.close()
 
 
 # ---------- snapshot and classification ----------
@@ -229,22 +228,21 @@ def trim_chunk(ch, loads) -> str:
             return "skipped"
 
     for e in extras:                       # extras come from the most-loaded workers
-        conn = get_conn()
-        try:
-            with conn:
-                conn.execute("DELETE FROM chunk_replicas WHERE chunk_id=? AND worker_id=?",
-                             (cid, e["worker_id"]))
-        finally:
-            conn.close()
-        if not delete_chunk(e["address"], cid):
-            queue_pending_delete(cid, e["worker_id"])
+        key = (cid, e["worker_id"])
+        with transaction() as conn:
+            conn.execute("DELETE FROM chunk_replicas WHERE chunk_id=? AND worker_id=?", key)
+            conn.execute("INSERT OR IGNORE INTO pending_deletes VALUES (?,?,?)", (*key, now()))
+        if delete_chunk(e["address"], cid):
+            with transaction() as conn:
+                conn.execute("DELETE FROM pending_deletes WHERE chunk_id=? AND worker_id=?", key)
         log.info("chunk %s over-replicated: removed extra copy from %s", cid, e["worker_id"])
         _bump("trims")
     return "trimmed"
 
 
 # ---------- one cycle ----------
-def _guarded(cid, fn, *args):
+def run_guarded(cid, fn, *args):
+    """Keep repair, trimming and reconciliation cleanup from overlapping on a chunk."""
     with _inflight_lock:
         if cid in _inflight:
             return "busy"
@@ -268,9 +266,9 @@ def run_cycle(pool):
         cls = classify(ch)
         classes[cid] = cls
         if cls == "repair":
-            futures[cid] = pool.submit(_guarded, cid, repair_chunk, ch)
+            futures[cid] = pool.submit(run_guarded, cid, repair_chunk, ch)
         elif cls == "over":
-            futures[cid] = pool.submit(_guarded, cid, trim_chunk, ch, loads)
+            futures[cid] = pool.submit(run_guarded, cid, trim_chunk, ch, loads)
     results = {cid: f.result() for cid, f in futures.items()}
 
     # counts AFTER the work, so the report shows where the system stands now

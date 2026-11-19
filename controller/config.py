@@ -11,3 +11,6 @@ WORKER_CONNECT_TIMEOUT = float(os.getenv("WORKER_CONNECT_TIMEOUT", 2))
 WORKER_READ_TIMEOUT = float(os.getenv("WORKER_READ_TIMEOUT", 10))
 REPAIR_INTERVAL = float(os.getenv("REPAIR_INTERVAL", "5"))     # seconds between cycles
 REPAIR_PARALLELISM = int(os.getenv("REPAIR_PARALLELISM", "4"))  # concurrent chunk repairs
+JANITOR_INTERVAL = float(os.getenv("JANITOR_INTERVAL", "30"))
+STALE_UPLOAD_AGE = float(os.getenv("STALE_UPLOAD_AGE", "60"))
+ORPHAN_MIN_AGE = float(os.getenv("ORPHAN_MIN_AGE", "600"))

@@ -71,7 +71,7 @@ def abort_upload(object_id: str, written: list):
             c = get_conn()
             try:
                 with c:
-                    c.execute("INSERT INTO pending_deletes(chunk_id, worker_id, created_at) VALUES (?,?,?)",
+                    c.execute("INSERT OR IGNORE INTO pending_deletes(chunk_id, worker_id, created_at) VALUES (?,?,?)",
                               (chunk_id, worker_id, now()))
             finally:
                 c.close()
