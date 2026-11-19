@@ -32,7 +32,7 @@ def parse_metadata(raw: str | None) -> dict:
 ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 def is_valid_id(s: str) -> bool:
-    return bool(ID_RE.fullmatch(s))
+    return len(s) <= 255 and bool(ID_RE.fullmatch(s))
 def parse_patch(raw: bytes) -> dict:
     """Validate a merge-patch body. null values are allowed here because they mean 'delete key'."""
     try:

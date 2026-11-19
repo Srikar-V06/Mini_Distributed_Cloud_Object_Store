@@ -1,6 +1,7 @@
 """Pipe into a Docker worker with python - CHUNK_ID MODE to damage a test replica."""
 
 import argparse
+from hashlib import sha256
 
 import storage
 
@@ -17,6 +18,7 @@ def main() -> None:
     if not path.is_file() or path.stat().st_size == 0:
         parser.error(f"nonempty chunk not found: {args.chunk_id}")
 
+    before = sha256(path.read_bytes()).hexdigest()
     if args.mode == "flip":
         with path.open("r+b") as chunk:
             byte = chunk.read(1)[0]
@@ -34,7 +36,8 @@ def main() -> None:
         path.write_bytes(bytes(path.stat().st_size))
     else:
         path.with_suffix(".sha256").write_text("invalid checksum\n")
-    print(f"applied {args.mode} to {args.chunk_id}")
+    after = sha256(path.read_bytes()).hexdigest() if path.exists() else "missing"
+    print(f"{args.mode} on {args.chunk_id} | SHA-256 before {before} | after {after}")
 
 
 if __name__ == "__main__":

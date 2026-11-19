@@ -16,6 +16,7 @@ import registry
 import scrubber
 import upload
 import download
+from download_guard import DownloadGuard
 import os
 import objects_api
 import admin_replication, repair
@@ -46,6 +47,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+app.add_middleware(DownloadGuard)
 app.include_router(upload.router)
 app.include_router(download.router)
 app.include_router(objects_api.router)
