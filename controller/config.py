@@ -9,3 +9,5 @@ REPLICATION_FACTOR = 2
 MAX_REPLACEMENT_ROUNDS = 3
 WORKER_CONNECT_TIMEOUT = float(os.getenv("WORKER_CONNECT_TIMEOUT", 2))
 WORKER_READ_TIMEOUT = float(os.getenv("WORKER_READ_TIMEOUT", 10))
+REPAIR_INTERVAL = float(os.getenv("REPAIR_INTERVAL", "5"))     # seconds between cycles
+REPAIR_PARALLELISM = int(os.getenv("REPAIR_PARALLELISM", "4"))  # concurrent chunk repairs

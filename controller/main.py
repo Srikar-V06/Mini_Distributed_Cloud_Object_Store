@@ -16,6 +16,7 @@ import upload
 import download
 import os
 import objects_api
+import admin_replication, repair
 from db import init_db
 from error_handlers import install_error_handling
 
@@ -31,7 +32,9 @@ async def lifespan(app: FastAPI):
     stop = threading.Event()
     threading.Thread(target=registry.liveness_loop, args=(stop,), daemon=True).start()
     log.info("controller ready (startup grace period active)")
+    repair.start()
     yield
+    repair.stop() 
     stop.set()
 
 
@@ -39,6 +42,7 @@ app = FastAPI(lifespan=lifespan)
 app.include_router(upload.router)
 app.include_router(download.router)
 app.include_router(objects_api.router)
+app.include_router(admin_replication.router)
 install_error_handling(app)
 
 class HeartbeatBody(BaseModel):
